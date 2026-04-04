@@ -305,6 +305,17 @@ async function t10xInit() {
   if (currentPage.includes('build.php?id=39') || currentPage.includes('dorf1.php') || currentPage.includes('village1.php')) {
     t10xDetectArmy();
   }
+
+  // --- Task Manager Data Scrapers ---
+  if (currentPage.includes('village1.php') || currentPage.includes('dorf1.php') || currentPage.includes('village2.php') || currentPage.includes('dorf2.php')) {
+    t10xScrapeVillageBuildings();
+  }
+  
+  if (currentPage.includes('build.php')) {
+    t10xInjectQueueButtons();
+  }
+  
+  initTaskManagerUI();
   // Initialize ROI Calculator
   if (t10xState.roiCalculator) {
     // Try to load cached fields
@@ -1040,6 +1051,8 @@ async function t10xShowScannerDashboard(oases) {
   const existing = document.getElementById('t10x-oasis-dashboard');
   if (existing) existing.remove();
 
+  // (Bottom panel Auto-Farm control removed per user request)
+
   // Load auto-farm state from storage
   const farmState = await t10xGetSettings(
     ['is_autofarming_active', 'active_farm_list'],
@@ -1150,7 +1163,7 @@ async function t10xShowScannerDashboard(oases) {
     // Header
     const thead = document.createElement('thead');
     const headerRow = document.createElement('tr');
-    ['Coords', 'Ani', 'Dist', 'Loss', 'State', 'Auto'].forEach(col => {
+    ['Coords', 'Ani', 'Dist', 'Last', 'Live', 'Fill', 'State', 'Auto'].forEach(col => {
       const th = document.createElement('th');
       th.textContent = col;
       headerRow.appendChild(th);
@@ -1206,10 +1219,54 @@ async function t10xShowScannerDashboard(oases) {
       const tdDist = document.createElement('td');
       tdDist.textContent = Math.round(o.distance);
 
-      // Loss cell
-      const tdLoss = document.createElement('td');
-      tdLoss.style.color = lossColor;
-      tdLoss.textContent = `${lossVal}%`;
+      // Loss check (kept for animal count vs simulation, but column is now "Last/Live/Fill")
+      // const tdLoss = document.createElement('td');
+      // tdLoss.style.color = lossColor;
+      // tdLoss.textContent = `${lossVal}%`;
+
+      // Last Raid cell
+      const tdLast = document.createElement('td');
+      tdLast.className = 't10x-last-raid-cell';
+      if (farmEntry) {
+        const lastArrival = farmEntry.exactArrivalTime;
+        const lastHit = farmEntry.lastHit;
+        if (lastArrival) {
+          tdLast.textContent = lastArrival;
+          tdLast.title = 'Exact arrival from report';
+        } else if (lastHit) {
+          const diffMin = Math.floor((Date.now() - lastHit) / 60000);
+          tdLast.textContent = diffMin < 60 ? `${diffMin}m` : `${Math.floor(diffMin/60)}h`;
+          tdLast.title = 'Time since dispatch';
+        } else {
+          tdLast.textContent = '—';
+        }
+      } else {
+        tdLast.textContent = '—';
+      }
+
+      // Live status cell
+      const tdLive = document.createElement('td');
+      tdLive.className = 't10x-live-status-cell';
+      if (farmEntry && farmEntry.estimatedArrivalTime && Date.now() < farmEntry.estimatedArrivalTime) {
+        const liveDot = document.createElement('span');
+        liveDot.className = 't10x-live-indicator';
+        liveDot.title = 'Raid incoming...';
+        tdLive.appendChild(liveDot);
+      } else {
+        tdLive.textContent = '—';
+      }
+
+      // Fill percentage cell
+      const tdFill = document.createElement('td');
+      tdFill.className = 't10x-fill-percent-cell';
+      if (farmEntry && farmEntry.lastBountyPercent !== undefined) {
+        const p = farmEntry.lastBountyPercent;
+        tdFill.textContent = `${p}%`;
+        tdFill.style.color = p > 90 ? '#ffcc00' : (p > 50 ? '#4ecca3' : '#888');
+        tdFill.title = `Last bounty: ${p}% of capacity`;
+      } else {
+        tdFill.textContent = '—';
+      }
 
       // State badge cell
       const tdState = document.createElement('td');
@@ -1290,7 +1347,9 @@ async function t10xShowScannerDashboard(oases) {
       tr.appendChild(tdCoords);
       tr.appendChild(tdAni);
       tr.appendChild(tdDist);
-      tr.appendChild(tdLoss);
+      tr.appendChild(tdLast);
+      tr.appendChild(tdLive);
+      tr.appendChild(tdFill);
       tr.appendChild(tdState);
       tr.appendChild(tdAuto);
       tbody.appendChild(tr);
@@ -1959,6 +2018,364 @@ function t10xSendNotification(title, message) {
       message: message
     });
   }
+}
+
+// ============================================================
+// INFINITE TASK MANAGER
+// ============================================================
+
+async function t10xScrapeVillageBuildings() {
+  const isVillage1 = window.location.pathname.includes('village1.php') || window.location.pathname.includes('dorf1.php');
+  const isVillage2 = window.location.pathname.includes('village2.php') || window.location.pathname.includes('dorf2.php');
+  
+  if (!isVillage1 && !isVillage2) return;
+
+  const contentArea = document.querySelector('.wrapper, .content, #content, #main, body');
+  if (!contentArea) return;
+
+  // --- Tribe Detection ---
+  let player_tribe = 'unknown';
+  const tribeImg = document.querySelector('img.unit, .sideInfo img[src*="unit"]');
+  if (tribeImg) {
+    const src = tribeImg.getAttribute('src');
+    if (src.includes('u1.gif') || src.includes('u2.gif') || src.includes('u3.gif')) player_tribe = 'roman';
+    else if (src.includes('u11.gif')) player_tribe = 'teuton';
+    else if (src.includes('u21.gif')) player_tribe = 'gaul';
+  }
+
+  // --- Queue Detection ---
+  const native_queue_blocks = [];
+  const buildList = document.querySelector('.buildingList, #content .boxes.content table, .build_details');
+  if (buildList) {
+    const rows = buildList.querySelectorAll('tr, li');
+    rows.forEach(row => {
+      const text = row.textContent.toLowerCase();
+      if (text.includes('level') || text.includes('stufe')) {
+        // Simple heuristic: buildId 1-18 are fields
+        // In the building list, we can usually see the name
+        const isField = /wood|clay|iron|crop|holz|lehm|eisen|getreide/i.test(text);
+        native_queue_blocks.push({ type: isField ? 'field' : 'building' });
+      }
+    });
+  }
+
+  const allLinks = contentArea.querySelectorAll('a, area');
+  const extracted = {};
+
+  for (let i = 0; i < allLinks.length; i++) {
+    const link = allLinks[i];
+    const href = link.getAttribute('href') || '';
+    const idMatch = href.match(/[?&]id=(\d+)/);
+    
+    if (!idMatch) continue;
+    
+    const buildId = parseInt(idMatch[1]);
+    const text = (link.textContent || '').toLowerCase();
+    const alt = (link.getAttribute('alt') || '').toLowerCase();
+    const title = (link.getAttribute('title') || '').toLowerCase();
+    const fullText = text + ' ' + alt + ' ' + title;
+    
+    const levelMatch = fullText.match(/level\s*(\d+)/i);
+    const level = levelMatch ? parseInt(levelMatch[1]) : 0;
+    
+    let name = 'Unknown';
+    const nameMatch = (title || alt).match(/^([^<0-9]+)/);
+    if (nameMatch) {
+      name = nameMatch[1].trim();
+    } else if (text) {
+      name = text.split('\n')[0].trim();
+    }
+    
+    if (buildId >= 1 && buildId <= 40) {
+      extracted[buildId] = {
+        buildId,
+        level,
+        name: name,
+        isField: buildId >= 1 && buildId <= 18
+      };
+    }
+  }
+
+  const storageData = await chrome.storage.local.get(['village_buildings']);
+  const buildings = storageData.village_buildings || {};
+  
+  for (const id in extracted) {
+    buildings[id] = extracted[id];
+  }
+  
+  await chrome.storage.local.set({ 
+    village_buildings: buildings,
+    native_queue_blocks,
+    player_tribe
+  });
+}
+
+function t10xInjectQueueButtons() {
+  // Extract node ID from current URL
+  const idMatch = window.location.href.match(/[?&]id=(\d+)/);
+  if (!idMatch) return;
+  const buildId = parseInt(idMatch[1]);
+
+  const contractArea = document.getElementById('contract');
+  if (contractArea && !contractArea.dataset.t10xButtonInjected) {
+    contractArea.dataset.t10xButtonInjected = "true";
+    
+    // Look for target level in the contract text (e.g., "to upgrade to level 3:")
+    const textContent = contractArea.textContent;
+    const match = textContent.match(/level\s*(\d+)/i);
+    const targetLevel = match ? parseInt(match[1]) : null;
+
+    if (targetLevel) {
+      const qBtn = document.createElement('button');
+      qBtn.className = 't10x-queue-plus-btn';
+      qBtn.style.marginLeft = '10px';
+      qBtn.textContent = 'Queue +';
+      qBtn.title = `Add Level ${targetLevel} to Infinite Queue`;
+      
+      qBtn.onclick = async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        
+        const { task_queue } = await chrome.storage.local.get('task_queue');
+        const queue = task_queue || [];
+        queue.push({
+          id: 'task_' + Date.now() + '_' + Math.floor(Math.random()*1000),
+          type: 'building',
+          buildId: buildId,
+          target_level: targetLevel,
+          priority: 1,
+          status: 'waiting'
+        });
+        await chrome.storage.local.set({ task_queue: queue });
+        qBtn.textContent = 'Queued ✓';
+        qBtn.style.background = '#4ecca3';
+      };
+      
+      // Find the best place to append
+      const link = contractArea.querySelector('a.build');
+      const noneSpan = contractArea.querySelector('span.none');
+      if (link) {
+         link.parentNode.insertBefore(qBtn, link.nextSibling);
+      } else if (noneSpan) {
+         noneSpan.parentNode.appendChild(qBtn);
+      } else {
+         contractArea.appendChild(qBtn);
+      }
+    }
+  }
+}
+
+async function initTaskManagerUI() {
+  let bottomPanel = document.getElementById('t10x-bottom-panel');
+  if (!bottomPanel) {
+    bottomPanel = document.createElement('div');
+    bottomPanel.id = 't10x-bottom-panel';
+    bottomPanel.className = 't10x-bottom-panel';
+    document.body.appendChild(bottomPanel);
+  }
+
+  // Load saved position
+  const savedPos = await chrome.storage.local.get('t10x_taskmgr_pos');
+  if (savedPos.t10x_taskmgr_pos) {
+    bottomPanel.style.top = savedPos.t10x_taskmgr_pos.top;
+    bottomPanel.style.left = savedPos.t10x_taskmgr_pos.left;
+    bottomPanel.style.bottom = 'auto'; // Disable bottom anchor
+  }
+
+  let taskPanel = document.getElementById('t10x-task-mgr');
+  
+  if (!taskPanel) {
+    taskPanel = document.createElement('div');
+    taskPanel.id = 't10x-task-mgr';
+    taskPanel.className = 't10x-task-mgr-container';
+    
+    taskPanel.innerHTML = `
+      <div class="t10x-task-header" id="t10x-task-drag-handle" style="cursor: move;">
+        <div style="display:flex; flex-direction:column; pointer-events:none;">
+          <h3 style="pointer-events:none;">Development Queue</h3>
+          <span id="t10x-task-status-text" style="font-size: 8px; color: #4ecca3; text-transform: uppercase;">Idle</span>
+        </div>
+        <label class="t10x-switch">
+          <input type="checkbox" id="t10x-task-mgr-toggle">
+          <span class="t10x-slider round"></span>
+        </label>
+      </div>
+      <div class="t10x-task-list" id="t10x-queued-tasks">
+        <div class="t10x-empty-queue">Queue is empty</div>
+      </div>
+      <div class="t10x-task-actions">
+        <button id="t10x-btn-next-roi" title="Queue the best ROI field">Queue Best ROI</button>
+        <button id="t10x-btn-equalize" title="Queue lowest field">Equalize Fields</button>
+        <button id="t10x-btn-clear" title="Clear entire queue" style="background: #900;">Clear All</button>
+      </div>
+    `;
+
+    // --- Drag Logic ---
+    let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
+    const dragHandle = taskPanel.querySelector('#t10x-task-drag-handle');
+    
+    dragHandle.onmousedown = (e) => {
+      // Don't drag if clicking the switch
+      if (e.target.closest('.t10x-switch')) return;
+      
+      e.preventDefault();
+      pos3 = e.clientX;
+      pos4 = e.clientY;
+      document.onmouseup = closeDragElement;
+      document.onmousemove = elementDrag;
+    };
+
+    function elementDrag(e) {
+      e.preventDefault();
+      pos1 = pos3 - e.clientX;
+      pos2 = pos4 - e.clientY;
+      pos3 = e.clientX;
+      pos4 = e.clientY;
+      bottomPanel.style.top = (bottomPanel.offsetTop - pos2) + "px";
+      bottomPanel.style.left = (bottomPanel.offsetLeft - pos1) + "px";
+      bottomPanel.style.bottom = 'auto';
+    }
+
+    async function closeDragElement() {
+      document.onmouseup = null;
+      document.onmousemove = null;
+      // Save position
+      await chrome.storage.local.set({ 
+        t10x_taskmgr_pos: { 
+          top: bottomPanel.style.top, 
+          left: bottomPanel.style.left 
+        } 
+      });
+    }
+    
+    const autoFarmExt = document.getElementById('t10x-autofarm-mgr');
+    if (autoFarmExt && autoFarmExt.parentElement === bottomPanel) {
+      bottomPanel.insertBefore(taskPanel, autoFarmExt);
+    } else {
+      bottomPanel.appendChild(taskPanel);
+    }
+
+    // Attach listeners
+    const toggle = document.getElementById('t10x-task-mgr-toggle');
+    const { is_task_manager_active } = await chrome.storage.local.get('is_task_manager_active');
+    toggle.checked = !!is_task_manager_active;
+    
+    toggle.addEventListener('change', async (e) => {
+      await chrome.storage.local.set({ is_task_manager_active: e.target.checked });
+    });
+
+    document.getElementById('t10x-btn-next-roi').textContent = '+1 All Fields';
+    document.getElementById('t10x-btn-next-roi').onclick = async () => {
+      const { village_buildings, task_queue } = await chrome.storage.local.get(['village_buildings', 'task_queue']);
+      const buildings = village_buildings || {};
+      const queue = task_queue || [];
+
+      // Queue every field (1-18) to the next level
+      let added = 0;
+      for (let id = 1; id <= 18; id++) {
+        if (buildings[id]) {
+          queue.push({
+            id: 'task_' + Date.now() + '_' + Math.floor(Math.random()*1000),
+            type: 'building',
+            buildId: id,
+            target_level: buildings[id].level + 1,
+            priority: 1,
+            status: 'waiting'
+          });
+          added++;
+        }
+      }
+      await chrome.storage.local.set({ task_queue: queue });
+      t10xRenderTaskQueue();
+      alert(`Queued +1 level for ${added} resource fields!`);
+    };
+
+    document.getElementById('t10x-btn-equalize').onclick = async () => {
+      const { village_buildings, task_queue } = await chrome.storage.local.get(['village_buildings', 'task_queue']);
+      const buildings = village_buildings || {};
+      const queue = task_queue || [];
+
+      // Find the lowest field
+      let lowestField = null;
+      for (let id = 1; id <= 18; id++) {
+        if (buildings[id]) {
+          if (!lowestField || buildings[id].level < lowestField.level) {
+            lowestField = buildings[id];
+          }
+        }
+      }
+
+      if (lowestField) {
+        queue.push({
+          id: 'task_' + Date.now() + '_' + Math.floor(Math.random()*1000),
+          type: 'building',
+          buildId: lowestField.buildId,
+          target_level: lowestField.level + 1,
+          priority: 2, // High priority
+          status: 'waiting'
+        });
+        await chrome.storage.local.set({ task_queue: queue });
+        t10xRenderTaskQueue();
+        alert(`Queued lowest field: ${lowestField.name} to level ${lowestField.level + 1}`);
+      }
+    };
+    
+    document.getElementById('t10x-btn-clear').onclick = async () => {
+      if (confirm('Are you sure you want to clear the entire queue?')) {
+        await chrome.storage.local.set({ task_queue: [], task_manager_status: 'Idle' });
+        t10xRenderTaskQueue();
+      }
+    };
+
+    // Render list loop
+    setInterval(t10xRenderTaskQueue, 2000);
+    t10xRenderTaskQueue();
+  }
+}
+
+async function t10xRenderTaskQueue() {
+  const listEl = document.getElementById('t10x-queued-tasks');
+  const statusEl = document.getElementById('t10x-task-status-text');
+  if (!listEl) return;
+
+  const { task_queue, village_buildings, task_manager_status } = await chrome.storage.local.get(['task_queue', 'village_buildings', 'task_manager_status']);
+  const queue = task_queue || [];
+  
+  if (statusEl) {
+    statusEl.textContent = task_manager_status || 'Idle';
+  }
+  
+  if (queue.length === 0) {
+    listEl.innerHTML = '<div class="t10x-empty-queue">Queue is empty</div>';
+    return;
+  }
+
+  listEl.innerHTML = '';
+  queue.forEach((task, idx) => {
+    let name = task.type === 'macro' ? task.target : 'Unknown Node';
+    if (task.type === 'building' && village_buildings && village_buildings[task.buildId]) {
+      name = village_buildings[task.buildId].name;
+    }
+    
+    const item = document.createElement('div');
+    item.className = 't10x-task-item';
+    item.innerHTML = `
+      <div class="t10x-task-info">
+        <span class="t10x-task-num">${idx+1}.</span> 
+        <span class="t10x-task-name">${name} &rarr; Lvl ${task.target_level || '?'}</span>
+      </div>
+      <button class="t10x-task-del" data-id="${task.id}">×</button>
+    `;
+    
+    item.querySelector('.t10x-task-del').onclick = async () => {
+      const { task_queue } = await chrome.storage.local.get('task_queue');
+      const newQ = (task_queue || []).filter(t => t.id !== task.id);
+      await chrome.storage.local.set({ task_queue: newQ });
+      t10xRenderTaskQueue();
+    };
+    
+    listEl.appendChild(item);
+  });
 }
 
 // ============================================================

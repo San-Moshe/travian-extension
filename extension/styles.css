@@ -262,7 +262,8 @@
   color: #888;
   font-weight: 600;
   text-transform: uppercase;
-  font-size: 10px;
+  font-size: 8px;
+  letter-spacing: 0.3px;
 }
 
 .t10x-radar-table .t10x-crop-9 {
@@ -301,12 +302,13 @@
   position: fixed;
   right: 20px;
   top: 90px;
-  width: 380px;
+  width: auto;
   z-index: 99996;
   display: flex;
   flex-direction: column;
   gap: 12px;
   pointer-events: none;
+  align-items: flex-end;
 }
 
 .t10x-side-panel > * {
@@ -732,6 +734,38 @@
   border: 1px solid rgba(85, 85, 85, 0.25);
 }
 
+/* Live Raid Indicator */
+.t10x-live-indicator {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  background: #ff4444;
+  border-radius: 50%;
+  box-shadow: 0 0 6px rgba(255, 68, 68, 0.6);
+  animation: t10x-live-pulse 1s infinite alternate;
+}
+
+@keyframes t10x-live-pulse {
+  from { transform: scale(0.8); opacity: 0.6; box-shadow: 0 0 4px rgba(255, 68, 68, 0.4); }
+  to { transform: scale(1.2); opacity: 1; box-shadow: 0 0 10px rgba(255, 68, 68, 0.8); }
+}
+
+.t10x-last-raid-cell {
+  color: #aaa;
+  font-family: 'Courier New', Courier, monospace;
+  font-size: 9px !important;
+  white-space: nowrap;
+}
+
+.t10x-fill-percent-cell {
+  font-weight: 700;
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+.t10x-live-status-cell {
+  text-align: center !important;
+}
+
 /* Action Cell Layout */
 .t10x-action-cell {
   display: flex;
@@ -779,4 +813,160 @@
 .t10x-farm-stats .t10x-stat-value {
   color: #ff9f43;
   font-weight: 600;
+}
+
+/* ============================================================
+   BOTTOM BAR LAYOUT STYLES
+   ============================================================ */
+
+.t10x-bottom-panel {
+  position: fixed;
+  top: 15%; /* Default fallback vertical position */
+  left: 25%; /* Default fallback horizontal position */
+  z-index: 99998;
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 20px;
+  width: auto;
+  max-width: 1200px;
+  pointer-events: none;
+}
+
+.t10x-bottom-panel > * {
+  pointer-events: auto;
+  flex: 0 1 600px; /* Take up to 600px in the center */
+}
+
+/* ============================================================
+   INFINITE TASK MANAGER STYLES
+   ============================================================ */
+
+.t10x-task-mgr-container {
+  background: linear-gradient(180deg, #1a1a2e 0%, #16213e 100%);
+  border: 2px solid #576574;
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+
+.t10x-task-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: #16213e;
+  border-bottom: 1px solid #333;
+}
+
+.t10x-task-header h3 {
+  font-size: 13px;
+  color: #5f27cd;
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.t10x-task-list {
+  padding: 8px;
+  max-height: 250px; /* Larger scrollable area */
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.t10x-empty-queue {
+  font-size: 11px;
+  color: #888;
+  text-align: center;
+  padding: 10px;
+}
+
+.t10x-task-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: rgba(0, 0, 0, 0.2);
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: 1px solid #333;
+  font-size: 11px;
+}
+
+.t10x-task-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.t10x-task-num {
+  color: #888;
+  font-weight: 600;
+}
+
+.t10x-task-name {
+  color: #c8d6e5;
+}
+
+.t10x-task-del {
+  background: transparent;
+  color: #ff6b6b;
+  border: none;
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.t10x-task-del:hover {
+  color: #ff4757;
+  transform: scale(1.1);
+}
+
+.t10x-task-actions {
+  display: flex;
+  gap: 6px;
+  padding: 8px;
+  background: #111827;
+  border-top: 1px solid #333;
+}
+
+.t10x-task-actions button {
+  flex: 1;
+  padding: 4px;
+  font-size: 10px;
+  background: #2f3542;
+  color: #fff;
+  border: 1px solid #576574;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.t10x-task-actions button:hover {
+  background: #576574;
+}
+
+/* In-game Queue + Button */
+.t10x-queue-plus-btn {
+  background: #ff9f43;
+  color: #fff;
+  border: none;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: bold;
+  cursor: pointer;
+  margin-left: 8px;
+  vertical-align: middle;
+  box-shadow: 0 2px 4px rgba(255, 159, 67, 0.4);
+  transition: all 0.2s ease;
+}
+
+.t10x-queue-plus-btn:hover {
+  background: #ffaf63;
+  transform: translateY(-1px);
 }

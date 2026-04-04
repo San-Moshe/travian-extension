@@ -23,7 +23,17 @@ const AUTOFARM_DEFAULTS = {
   dead_blacklist_hours: 48
 };
 
+const TASK_MANAGER_DEFAULTS = {
+  is_task_manager_active: false,
+  task_queue: [],
+  village_buildings: {},
+  player_tribe: 'unknown',
+  auto_npc_enabled: false,
+  native_queue_blocks: []
+};
+
 const ALARM_NAME = 'autofarm-loop';
+const TASK_ALARM_NAME = 'task-manager-loop';
 
 // Animal definitions (mirrors content.js T10X_ANIMALS)
 const BG_ANIMALS = {
@@ -55,23 +65,27 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 async function initializeDefaults() {
-  const existing = await chrome.storage.local.get(Object.keys(AUTOFARM_DEFAULTS));
+  const allDefaults = { ...AUTOFARM_DEFAULTS, ...TASK_MANAGER_DEFAULTS };
+  const existing = await chrome.storage.local.get(Object.keys(allDefaults));
   const toSet = {};
-  for (const [key, defaultVal] of Object.entries(AUTOFARM_DEFAULTS)) {
+  for (const [key, defaultVal] of Object.entries(allDefaults)) {
     if (existing[key] === undefined) {
       toSet[key] = defaultVal;
     }
   }
   if (Object.keys(toSet).length > 0) {
     await chrome.storage.local.set(toSet);
-    console.log('T10X AutoFarm: Initialized defaults', toSet);
+    console.log('T10X: Initialized defaults', toSet);
   }
 }
 
 async function setupAlarm() {
   await chrome.alarms.clear(ALARM_NAME);
   chrome.alarms.create(ALARM_NAME, { periodInMinutes: 10 / 60 }); // ~10 seconds (dev mode)
-  console.log('T10X AutoFarm: Alarm created (10 second interval)');
+  
+  await chrome.alarms.clear(TASK_ALARM_NAME);
+  chrome.alarms.create(TASK_ALARM_NAME, { periodInMinutes: 30 / 60 }); // 30 seconds
+  console.log('T10X: Alarms created');
 }
 
 // ============================================================
@@ -81,6 +95,8 @@ async function setupAlarm() {
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === ALARM_NAME) {
     await runFarmCycle();
+  } else if (alarm.name === TASK_ALARM_NAME) {
+    await runTaskManagerCycle();
   }
 });
 
@@ -161,9 +177,18 @@ async function runFarmCycle() {
     }
     console.log('T10X AutoFarm: [READY] Session found, processing targets...');
 
+    // 2.5 Deterministic Report Sync Engine - Sync and process all latest reports first
+    console.log('T10X AutoFarm: [SYNC] Updating report cache with latest battles...');
+    await syncReports(globalSettings);
+    await processFarmTransitions();
+
+    // Re-fetch the farm list since processFarmTransitions might have mutated it
+    const updatedSettings = await chrome.storage.local.get(['active_farm_list']);
+    const currentFarmList = updatedSettings.active_farm_list || farmList;
+
     // 3. Prioritize targets: Full bounty > Never hit > Normal
     // This ensures limited troops are sent to the most profitable oases first.
-    farmList.sort((a, b) => {
+    currentFarmList.sort((a, b) => {
       const getPriority = (f) => {
         if (f.lastBountyFull) return 2;
         if (!f.lastHit) return 1;
@@ -181,8 +206,8 @@ async function runFarmCycle() {
     listModified = true; // Mark as modified because we changed order
 
     // 4. Process each farm target
-    for (let i = 0; i < farmList.length; i++) {
-      const farm = farmList[i];
+    for (let i = 0; i < currentFarmList.length; i++) {
+      const farm = currentFarmList[i];
 
       // Skip dead farms (blacklisted)
       if (farm.state === 'dead') {
@@ -269,12 +294,7 @@ async function runFarmCycle() {
         listModified = true;
         console.log(`T10X AutoFarm: Attack sent to ${farm.coords}! Travel: ${Math.round(travelTimeMs/1000)}s, Arrival: ${attackResult.arrivalTime || 'unknown'}, Next in: ${Math.round((farm.nextAttackTime - Date.now())/1000)}s`);
 
-        // 7. Schedule report check right after expected arrival
-        setTimeout(() => {
-          scrapeLatestReport(farm, globalSettings).catch(e => {
-            console.warn(`T10X AutoFarm: Report scrape failed for ${farm.coords}`, e);
-          });
-        }, travelTimeMs + 2000); // add 2s buffer over arrival time
+        // Removed legacy setTimeout scrape: Reports are now deterministically synced by syncReports() on the next cycles
       } else if (attackResult.error === 'no_troops') {
         // Don't hammer — set a 60s retry window. Troops from earlier raids will return
         // by then, releasing capacity for this farm in round-robin order.
@@ -291,7 +311,7 @@ async function runFarmCycle() {
 
     // 8. Persist updated farm list
     if (listModified) {
-      await chrome.storage.local.set({ active_farm_list: farmList });
+      await chrome.storage.local.set({ active_farm_list: currentFarmList });
     }
 
   } catch (e) {
@@ -678,24 +698,22 @@ function extractHiddenFields(html) {
 // ============================================================
 
 /**
- * Scrape the latest battle report for a farm target.
- * Due to the missing coordinates bug on zravian reports, we use a heuristic 
- * matching the exact troop count sent to identify the correct report.
+ * Deterministic Report Sync Engine
+ * Fetches the reports hub, identifies unseen reports, parses them deeply,
+ * and stores them in a centralized, deterministic storage keyed by Target Tile ID.
  */
-async function scrapeLatestReport(farm, globalSettings) {
+async function syncReports(globalSettings) {
   try {
     const sessionKey = await getSessionKey();
     if (!sessionKey) return;
 
-    // Fetch reports page via game tab
-    const reportsResult = await fetchInGameTab(`${sessionKey}/report.php`);
-    if (!reportsResult.ok) {
-      console.warn('T10X AutoFarm: Reports page fetch failed', reportsResult.status);
-      return;
-    }
+    // We can fetch report.php?t=3 (Attacks) to only see attack reports
+    const reportsResult = await fetchInGameTab(`${sessionKey}/report.php?t=3`);
+    if (!reportsResult.ok) return;
+
     const reportsHtml = reportsResult.text;
 
-    // Extract all report IDs from the first page
+    // Extract all report IDs from the hub page
     const reportLinkRegex = /report\.php\?id=(\d+)/g;
     const recentReportIds = [];
     let match;
@@ -703,85 +721,158 @@ async function scrapeLatestReport(farm, globalSettings) {
       if (!recentReportIds.includes(match[1])) {
         recentReportIds.push(match[1]);
       }
-      if (recentReportIds.length >= 5) break; // Check up to top 5 recent reports
     }
 
-    if (recentReportIds.length === 0) {
-      console.log(`T10X AutoFarm: No recent reports found to match for ${farm.coords}`);
-      return;
-    }
+    if (recentReportIds.length === 0) return;
 
-    // Heuristic: Fetch reports and find the one that matches our sent troop count
-    let targetReportHtml = null;
-    let targetReportId = null;
+    // Load persistent state
+    const storageData = await chrome.storage.local.get(['processed_report_ids', 'report_cache']);
+    const processedIds = storageData.processed_report_ids || [];
+    const reportCache = storageData.report_cache || {};
 
-    for (const reportId of recentReportIds) {
+    let cacheModified = false;
+    let processedModified = false;
+
+    // Parse unseen reports in order (oldest first to ensure correct overwrite sequence)
+    // Actually, recentReportIds is newest-first. Let's process newest-first, and simply
+    // overwrite older ones if needed, or if we reverse we build up the correctly.
+    // Reversing ensures the latest report is processed last, leaving it in the cache!
+    const unseenIds = recentReportIds.filter(id => !processedIds.includes(id)).reverse();
+
+    for (const reportId of unseenIds) {
       const reportResult = await fetchInGameTab(`${sessionKey}/report.php?id=${reportId}`);
       if (!reportResult.ok) continue;
+
+      const html = reportResult.text;
+      const text = html.replace(/<[^>]+>/g, ' ');
+
+      // 1. Extract Target Tile ID (Deterministic Anchor)
+      // Look for: href="village3.php?id=10387" inside the Defender block
+      const defenderBlock = html.match(/(?:Defender|Verteidiger|Défenseur)[\s\S]{0,1000}?(?:tbody\s+class="units"|table\s+cellpadding)/i) 
+                        || html.match(/(?:Defender|Verteidiger|Défenseur)[\s\S]{0,500}/i);
       
-      const currentHtml = reportResult.text;
-      const reportedTroops = extractAttackerTroopCount(currentHtml);
-      
-      // If the report shows exactly the same number of troops we dispatched, we assume it's our match
-      if (reportedTroops === farm.lastTroopsSent) {
-        targetReportHtml = currentHtml;
-        targetReportId = reportId;
-        console.log(`T10X AutoFarm: Found matching report ${reportId} for ${farm.coords} using troop heuristic (${farm.lastTroopsSent} units)`);
-        break;
+      let targetTileId = null;
+      if (defenderBlock) {
+        const idMatch = defenderBlock[0].match(/village3\.php\?id=(\d+)/i);
+        if (idMatch) {
+          targetTileId = idMatch[1];
+        }
       }
+
+      if (!targetTileId) {
+        // If we can't tie it to a tile, mark as processed and skip
+        processedIds.push(reportId);
+        processedModified = true;
+        continue;
+      }
+
+      // 2. Extract Exact Time
+      // Look for: <td class="sent">Sent:</td><td>in 04 Apr 2026, <span> 23:48:20</span></td>
+      let timeMatch = html.match(/class=["']sent["'][^>]*>[\s\S]*?<span>\s*([\d:]+)\s*<\/span>/i);
+      let reportTimeStr = timeMatch ? timeMatch[1] : null;
+
+      // 3. Extract attacker troops sent (needed for carrying capacity calc)
+      const reportedTroops = extractAttackerTroopCount(html);
+      
+      // 4. Extract Casualties and Bounty
+      const hasCasualties = detectCasualties(html, text);
+      const carryCapacity = globalSettings?.troop_carry_capacity || 50;
+      const bountyInfo = detectBounty(html, text, reportedTroops || 1, carryCapacity);
+
+      // Store in Cache (Overwriting older ones because we loop oldest-to-newest)
+      reportCache[targetTileId] = {
+        reportId: reportId,
+        timeParsed: Date.now(),
+        reportTimeStr: reportTimeStr, // Useful for debug/correlation
+        hasCasualties: hasCasualties,
+        bountyTotal: bountyInfo.total,
+        bountyPercent: bountyInfo.percent,
+        isFull: bountyInfo.isFull,
+        troopsSentRecorded: reportedTroops
+      };
+
+      cacheModified = true;
+
+      // Mark processed
+      processedIds.push(reportId);
+      processedModified = true;
+
+      console.log(`T10X AutoFarm: Synced Report ${reportId} for Tile ${targetTileId}`);
     }
 
-    // Fallback: If we couldn't match by troop count, assume the very latest report 
-    // is ours since we are scraping ~2 seconds after estimated arrival time.
-    if (!targetReportHtml) {
-      console.warn(`T10X AutoFarm: Could not match report by troop count for ${farm.coords}. Falling back to newest report.`);
-      targetReportId = recentReportIds[0];
-      const fbResult = await fetchInGameTab(`${sessionKey}/report.php?id=${targetReportId}`);
-      if (fbResult.ok) targetReportHtml = fbResult.text;
+    // Keep processed list from leaking memory infinitely (keep last 500)
+    if (processedIds.length > 500) {
+      processedIds.splice(0, processedIds.length - 500);
+      processedModified = true;
     }
 
-    if (!targetReportHtml) return;
-
-    const reportText = targetReportHtml.replace(/<[^>]+>/g, ' ');
-
-    // Update farm list in storage
-    const { active_farm_list } = await chrome.storage.local.get('active_farm_list');
-    const farmList = active_farm_list || [];
-    const farmIndex = farmList.findIndex(f => f.coords === farm.coords);
-    if (farmIndex === -1) return;
-
-    const farmRef = farmList[farmIndex];
-
-    // ---- Detect Casualties ----
-    const hasCasualties = detectCasualties(targetReportHtml, reportText);
-    if (hasCasualties) {
-      console.log(`T10X AutoFarm: CASUALTIES detected at ${farm.coords} — entering DEAD state`);
-      farmRef.state = 'dead';
-      farmRef.deadSince = Date.now();
-      await chrome.storage.local.set({ active_farm_list: farmList });
-      return;
+    const updates = {};
+    if (cacheModified) updates.report_cache = reportCache;
+    if (processedModified) updates.processed_report_ids = processedIds;
+    
+    if (cacheModified || processedModified) {
+      await chrome.storage.local.set(updates);
     }
-
-    // ---- Detect Bounty ----
-    const bountyInfo = detectBounty(targetReportHtml, reportText, farmRef.lastTroopsSent, globalSettings.troop_carry_capacity);
-
-    if (bountyInfo.isFull) {
-      // Bounty was at max capacity — transition to 'overflow'
-      console.log(`T10X AutoFarm: Bounty FULL at ${farm.coords} — entering OVERFLOW state`);
-      farmRef.state = 'overflow';
-      farmRef.lastBountyFull = true;
-    } else {
-      // Bounty was partial — farm is empty, transition to 'steady_state'
-      console.log(`T10X AutoFarm: Bounty partial at ${farm.coords} — entering STEADY_STATE`);
-      farmRef.state = 'steady_state';
-      farmRef.lastBountyFull = false;
-      farmRef.timeEmptied = Date.now();
-    }
-
-    await chrome.storage.local.set({ active_farm_list: farmList });
 
   } catch (e) {
-    console.error(`T10X AutoFarm: Report scrape error for ${farm.coords}`, e);
+    console.error(`T10X AutoFarm: Report sync error`, e);
+  }
+}
+
+/**
+ * Checks active farms against the report cache to perform state transitions.
+ * Called immediately after syncing reports.
+ */
+async function processFarmTransitions() {
+  const settings = await chrome.storage.local.get(['active_farm_list', 'report_cache']);
+  const farmList = settings.active_farm_list || [];
+  const cache = settings.report_cache || {};
+
+  if (farmList.length === 0 || Object.keys(cache).length === 0) return;
+
+  let listModified = false;
+
+  for (const farm of farmList) {
+    // Only process farms that we hit and might need a state transition
+    if (!farm.lastHit || farm.state === 'dead') continue;
+
+    const report = cache[farm.id];
+    if (!report) continue;
+
+    // Check if we already applied this specific report
+    if (farm.lastAppliedReportId === report.reportId) continue;
+
+    // Ensure the report is ACTUALLY from our recent attack.
+    // The report must have been parsed AFTER we dispatched the troops!
+    // (A 1-minute buffer is safe since attacks take time to arrive).
+    // Or simpler: if this report was parsed after we dispatched + some time.
+    if (report.timeParsed > farm.lastHit) {
+      console.log(`T10X AutoFarm: Applying Report ${report.reportId} to Farm ${farm.coords}`);
+
+      if (report.hasCasualties) {
+        console.log(`T10X AutoFarm: CASUALTIES detected at ${farm.coords} — entering DEAD state`);
+        farm.state = 'dead';
+        farm.deadSince = Date.now();
+      } else if (report.isFull) {
+        console.log(`T10X AutoFarm: Bounty FULL at ${farm.coords} — entering OVERFLOW state`);
+        farm.state = 'overflow';
+        farm.lastBountyFull = true;
+      } else {
+        console.log(`T10X AutoFarm: Bounty partial at ${farm.coords} — entering STEADY_STATE`);
+        farm.state = 'steady_state';
+        farm.lastBountyFull = false;
+        farm.timeEmptied = Date.now();
+      }
+
+      farm.lastAppliedReportId = report.reportId;
+      farm.exactArrivalTime = report.reportTimeStr || farm.exactArrivalTime;
+      farm.lastBountyPercent = report.bountyPercent || 0;
+      listModified = true;
+    }
+  }
+
+  if (listModified) {
+    await chrome.storage.local.set({ active_farm_list: farmList });
   }
 }
 
@@ -820,37 +911,32 @@ function detectBounty(html, text, troopsSent, carryCapacity) {
 
   // Look for bounty/resources in the report text
   // Pattern: "Bounty: 200 | 150 | 100 | 50" or "Bounty: 200 150 100 50"
+  let totalBounty = 0;
   const bountyMatch = text.match(/(?:bounty|beute|butin)[:\s]*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)/i)
                    || text.match(/(?:bounty|beute|butin)[\s\S]{0,50}?(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/i);
 
   if (bountyMatch) {
-    const totalBounty = parseInt(bountyMatch[1]) + parseInt(bountyMatch[2]) 
-                      + parseInt(bountyMatch[3]) + parseInt(bountyMatch[4]);
-    const ratio = totalBounty / maxCarry;
-    return {
-      total: totalBounty,
-      maxCarry,
-      isFull: ratio >= 0.95
-    };
-  }
-
-  // Fallback: look for bounty section in HTML and extract numbers
-  const bountySection = html.match(/(?:bounty|beute|butin)[\s\S]{0,300}/i);
-  if (bountySection) {
-    const numbers = bountySection[0].match(/>\s*(\d+)\s*</g) || [];
-    const resNumbers = numbers.map(m => parseInt(m.replace(/[^\d]/g, ''))).filter(n => !isNaN(n) && n > 0);
-    if (resNumbers.length >= 4) {
-      const totalBounty = resNumbers.slice(0, 4).reduce((sum, v) => sum + v, 0);
-      return {
-        total: totalBounty,
-        maxCarry,
-        isFull: (totalBounty / maxCarry) >= 0.95
-      };
+    totalBounty = parseInt(bountyMatch[1]) + parseInt(bountyMatch[2]) 
+                + parseInt(bountyMatch[3]) + parseInt(bountyMatch[4]);
+  } else {
+    // Fallback: look for bounty section in HTML and extract numbers
+    const bountySection = html.match(/(?:bounty|beute|butin)[\s\S]{0,300}/i);
+    if (bountySection) {
+      const numbers = bountySection[0].match(/>\s*(\d+)\s*</g) || [];
+      const resNumbers = numbers.map(m => parseInt(m.replace(/[^\d]/g, ''))).filter(n => !isNaN(n) && n > 0);
+      if (resNumbers.length >= 4) {
+        totalBounty = resNumbers.slice(0, 4).reduce((sum, v) => sum + v, 0);
+      }
     }
   }
 
-  // If we can't determine, assume partial (conservative)
-  return { total: 0, maxCarry, isFull: false };
+  const ratio = maxCarry > 0 ? totalBounty / maxCarry : 0;
+  return {
+    total: totalBounty,
+    maxCarry,
+    percent: Math.min(100, Math.round(ratio * 100)),
+    isFull: ratio >= 0.95
+  };
 }
 
 /**
@@ -1000,3 +1086,134 @@ function delay(ms) {
 }
 
 console.log('T10X AutoFarm: Background service worker loaded');
+
+// ============================================================
+// INFINITE TASK MANAGER — EXECUTION ENGINE
+// ============================================================
+
+let isTaskManagerRunning = false;
+
+async function runTaskManagerCycle() {
+  if (isTaskManagerRunning) return;
+  isTaskManagerRunning = true;
+
+  try {
+    const settings = await chrome.storage.local.get([
+      'is_task_manager_active',
+      'task_queue',
+      'village_buildings',
+      'player_tribe',
+      'auto_npc_enabled',
+      'native_queue_blocks'
+    ]);
+
+    if (!settings.is_task_manager_active) {
+      await chrome.storage.local.set({ task_manager_status: 'Disabled' });
+      return;
+    }
+
+    const queue = settings.task_queue || [];
+    if (queue.length === 0) {
+      await chrome.storage.local.set({ task_manager_status: 'Idle (Queue Empty)' });
+      return;
+    }
+
+    console.log('T10X TaskMgr: [CHECK] Cycle started. Tribe:', settings.player_tribe, 'Queue length:', queue.length);
+
+    // 1. Queue Status & Roman-Awareness
+    // native_queue_blocks structure: [{type: 'field'}, {type: 'building'}] from content.js
+    const nativeBlocks = settings.native_queue_blocks || [];
+    let canBuildField = false;
+    let canBuildInfra = false;
+
+    if (settings.player_tribe === 'roman') {
+      const hasField = nativeBlocks.some(b => b.type === 'field');
+      const hasInfra = nativeBlocks.some(b => b.type === 'building');
+      canBuildField = !hasField;
+      canBuildInfra = !hasInfra;
+    } else {
+      const hasAny = nativeBlocks.length > 0;
+      canBuildField = !hasAny;
+      canBuildInfra = !hasAny;
+    }
+
+    if (!canBuildField && !canBuildInfra) {
+      const waitMsg = settings.player_tribe === 'roman' ? 'Waiting (Native Slots Full)' : 'Waiting (Construction in progress)';
+      await chrome.storage.local.set({ task_manager_status: waitMsg });
+      console.log('T10X TaskMgr: [SKIP] Native queue is full.');
+      return;
+    }
+
+    // 2. Head of Queue
+    const task = queue[0];
+    if (task.status === 'active') {
+      // It's actively building, wait for DOM sync to remove it
+      return; 
+    }
+
+    // Is it a field or a building?
+    // We rely on content.js populating task.isField when pushing to queue, or we determine it here.
+    const isField = task.buildId >= 1 && task.buildId <= 18;
+    
+    if (isField && !canBuildField) {
+      await chrome.storage.local.set({ task_manager_status: 'Waiting (Infrastructure Slot Busy)' });
+      console.log('T10X TaskMgr: [SKIP] Cannot build field right now.');
+      return;
+    }
+    if (!isField && !canBuildInfra) {
+      await chrome.storage.local.set({ task_manager_status: 'Waiting (Field Slot Busy)' });
+      console.log('T10X TaskMgr: [SKIP] Cannot build infra right now.');
+      return;
+    }
+
+    // 3. Dispatch Logic
+    // In Travian 3.6, building requires fetching the node page, then extracting the upgrade link with the `c=` token.
+    console.log('T10X TaskMgr: [READY] Task is ready to build:', task);
+    
+    // Check session
+    const tabs = await chrome.tabs.query({ url: "*://*.zravian.com/*" });
+    if (tabs.length === 0) {
+      console.log('T10X TaskMgr: [PAUSED] No active Zravian tabs to construct session relative URL');
+      return; 
+    }
+    const sessionOrigin = new URL(tabs[0].url).origin;
+
+    // Fetch the build page
+    const buildUrl = `${sessionOrigin}/build.php?id=${task.buildId}`;
+    const buildResp = await fetch(buildUrl);
+    const buildHtml = await buildResp.text();
+
+    if (buildHtml.includes('Not enough resources') || buildHtml.includes('Zu wenig Rohstoffe')) {
+      await chrome.storage.local.set({ task_manager_status: 'Waiting (Insufficient Resources)' });
+      console.log('T10X TaskMgr: [WAITING] Not enough resources for task:', task);
+      return;
+    }
+
+    // Find the build/upgrade link (Check both a/c and id/k parameter styles)
+    // Zravian uses id=X&k=Y for fields/buildings
+    const upgradeRegex = new RegExp(`href=["']([^"']*\\.php\\?[^"']*((id=${task.buildId}&k=[a-z0-9]+)|(k=[a-z0-9]+&id=${task.buildId})|(a=${task.buildId}&c=[a-z0-9]+)|(c=[a-z0-9]+&a=${task.buildId}))[^"']*)["']`, 'i');
+    const linkMatch = buildHtml.match(upgradeRegex);
+                      
+    if (linkMatch) {
+      await chrome.storage.local.set({ task_manager_status: 'Executing...' });
+      const execUrl = `${sessionOrigin}/${linkMatch[1].replace(/&amp;/g, '&')}`;
+      console.log('T10X TaskMgr: Executing upgrade via:', execUrl);
+      
+      const execResp = await fetch(execUrl);
+      if (execResp.ok) {
+        // Success, remove from queue
+        queue.shift();
+        await chrome.storage.local.set({ task_queue: queue, task_manager_status: 'Success' });
+        console.log('T10X TaskMgr: [SUCCESS] Task completed and removed from queue');
+      }
+    } else {
+      await chrome.storage.local.set({ task_manager_status: 'Error (Link Not Found)' });
+      console.log('T10X TaskMgr: [ERROR] Could not find upgrade link on build.php for task:', task);
+    }
+
+  } catch (e) {
+    console.error('T10X TaskMgr: Cycle error', e);
+  } finally {
+    isTaskManagerRunning = false;
+  }
+}
