@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Travian 3.6 10x Companion",
+  "version": "1.1.0",
+  "description": "Companion for Travian 3.6 10x servers - overflow monitor, queue alarm, crop scanner, ROI calculator, protection tracker, and auto-farm engine",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "notifications",
+    "scripting",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

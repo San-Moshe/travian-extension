@@ -1,0 +1,46 @@
+- generic [ref=e3]:
+  - generic [ref=e4]: You've been logged out. This most probably means someone else has logged into your account or your session has timed out.
+  - 'link "Server 1 Speed: x4 Players: 34 Natars after: 1 month Round started: 17 hours ago Beginner''s protection: 1 week Warehouse size: x2 Cranny size: x2 Troop movement speed: x2" [ref=e5] [cursor=pointer]':
+    - /url: //one.zravian.com/
+    - insertion:
+      - heading "Server 1" [level=1] [ref=e6]
+    - generic [ref=e7]: "Speed: x4"
+    - generic [ref=e8]: "Players: 34"
+    - generic [ref=e9]: "Natars after: 1 month"
+    - generic [ref=e10]: "Round started: 17 hours ago"
+    - generic [ref=e11]: "Beginner's protection: 1 week"
+    - generic [ref=e12]: "Warehouse size: x2"
+    - generic [ref=e13]: "Cranny size: x2"
+    - generic [ref=e14]: "Troop movement speed: x2"
+  - 'link "Nonstop Speed: x10 Players: 53 Natars after: 1 year Round started: 16 hours ago Beginner''s protection: 2 weeks Warehouse size: x10 Cranny size: x10 Troop movement speed: x10" [active] [ref=e15] [cursor=pointer]':
+    - /url: //nonstop.zravian.com/
+    - insertion:
+      - heading "Nonstop" [level=1] [ref=e16]
+    - generic [ref=e17]: "Speed: x10"
+    - generic [ref=e18]: "Players: 53"
+    - generic [ref=e19]: "Natars after: 1 year"
+    - generic [ref=e20]: "Round started: 16 hours ago"
+    - generic [ref=e21]: "Beginner's protection: 2 weeks"
+    - generic [ref=e22]: "Warehouse size: x10"
+    - generic [ref=e23]: "Cranny size: x10"
+    - generic [ref=e24]: "Troop movement speed: x10"
+  - generic [ref=e37]:
+    - text: "Username:"
+    - textbox "Username:" [ref=e38]
+    - text: "Password:"
+    - textbox "Password:" [ref=e39]
+    - button "Log in" [ref=e40]
+    - button "Register" [ref=e41]
+    - button "Recover" [ref=e42]
+  - 'link "Server 2 Speed: x10 Players: 49 Natars after: 3 days Round started: 1 week ago Beginner''s protection: 1 day Warehouse size: x15 Cranny size: x10 Troop movement speed: x150" [ref=e25] [cursor=pointer]':
+    - /url: //two.zravian.com/
+    - insertion:
+      - heading "Server 2" [level=1] [ref=e26]
+    - generic [ref=e28]: "Speed: x10"
+    - generic [ref=e29]: "Players: 49"
+    - generic [ref=e30]: "Natars after: 3 days"
+    - generic [ref=e31]: "Round started: 1 week ago"
+    - generic [ref=e32]: "Beginner's protection: 1 day"
+    - generic [ref=e33]: "Warehouse size: x15"
+    - generic [ref=e34]: "Cranny size: x10"
+    - generic [ref=e35]: "Troop movement speed: x150"

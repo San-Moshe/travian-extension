@@ -1,0 +1,72 @@
+- generic [ref=e2]:
+  - banner [ref=e3]:
+    - generic [ref=e4]:
+      - heading "Extensions" [level=1] [ref=e9]
+      - generic [ref=e12]:
+        - button [ref=e13] [cursor=pointer]
+        - generic [ref=e16]:
+          - generic [ref=e17]: Search extensions
+          - searchbox "Search extensions" [ref=e18]
+      - generic [ref=e21]:
+        - generic [ref=e22]: Developer mode
+        - button "Developer mode" [pressed] [ref=e23] [cursor=pointer]
+    - generic [ref=e27]:
+      - button "Load unpacked" [ref=e28] [cursor=pointer]:
+        - generic [ref=e29]:
+          - generic: Load unpacked
+      - button "Pack extension" [ref=e30] [cursor=pointer]:
+        - generic [ref=e31]:
+          - generic: Pack extension
+      - button "Update" [ref=e32] [cursor=pointer]:
+        - generic [ref=e33]:
+          - generic: Update
+  - generic [ref=e34]:
+    - navigation [ref=e36]:
+      - menu [ref=e37]:
+        - generic:
+          - menuitem "My extensions" [ref=e38] [cursor=pointer]:
+            - generic:
+              - img
+            - text: My extensions
+          - menuitem "Keyboard shortcuts" [ref=e39] [cursor=pointer]:
+            - generic:
+              - img
+            - text: Keyboard shortcuts
+      - generic [ref=e42]:
+        - text: Developing extensions? Stay up to date on
+        - link "What's New" [ref=e43] [cursor=pointer]:
+          - /url: https://developer.chrome.com/docs/extensions/whats-new?utm_source=ext_sidebar&hl=en-US
+        - text: with Chrome Extension developer documentation.
+      - generic [ref=e45]:
+        - generic:
+          - img
+        - generic [ref=e46]:
+          - text: Discover more extensions and themes on the
+          - link "Chrome Web Store" [ref=e47] [cursor=pointer]:
+            - /url: https://chromewebstore.google.com/category/extensions?utm_source=ext_sidebar&hl=en-US
+    - main [ref=e48]:
+      - generic [ref=e86]:
+        - generic [ref=e87]:
+          - button "Back" [ref=e88] [cursor=pointer]
+          - heading "Errors" [level=2] [ref=e91]
+          - button "Reload" [ref=e117] [cursor=pointer]
+          - button "Clear all" [ref=e95] [cursor=pointer]:
+            - generic [ref=e96]:
+              - generic: Clear all
+        - generic [ref=e99]:
+          - generic [ref=e100]:
+            - 'button "Uncaught SyntaxError: Unexpected token ''}''" [expanded] [ref=e101] [cursor=pointer]':
+              - generic "Error" [ref=e102]:
+                - img
+              - generic [ref=e103]: "Uncaught SyntaxError: Unexpected token '}'"
+            - button "Clear entry" [ref=e105] [cursor=pointer]
+          - group [ref=e108]:
+            - generic [ref=e109]:
+              - heading "Context" [level=3] [ref=e110]
+              - generic [ref=e111]: https://nonstop.zravian.com/build.php?id=14
+              - heading "Stack Trace" [level=3] [ref=e112]
+              - list [ref=e113]:
+                - listitem [ref=e114] [cursor=pointer]: content.js:574 (anonymous function)
+              - generic [ref=e116]: Nothing to see here, move along.
+  - alert [ref=e120]:
+    - generic [ref=e121]: Reloaded
