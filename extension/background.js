@@ -170,8 +170,6 @@ async function runFarmCycle() {
       overflow_multiplier: settings.overflow_multiplier || 2.0
     };
 
-    let listModified = false;
-
     // 2. Get session key from the active tab
     const sessionKey = await getSessionKey();
     if (!sessionKey) {
@@ -246,7 +244,6 @@ async function runFarmCycle() {
       // Tie-breaker: oldest hit first (least recently raided)
       return (a.lastHit || 0) - (b.lastHit || 0);
     });
-    listModified = true; // Mark as modified because we changed order
 
     // 4. Process each farm target
     for (let i = 0; i < currentFarmList.length; i++) {
@@ -258,7 +255,7 @@ async function runFarmCycle() {
           console.log(`T10X AutoFarm: Reviving dead farm ${farm.coords} after blacklist period`);
           farm.state = 'unknown';
           farm.deadSince = null;
-          listModified = true;
+          await atomicUpdateFarm(farm.id, { state: 'unknown', deadSince: null });
         } else {
           continue;
         }
@@ -287,7 +284,7 @@ async function runFarmCycle() {
           console.log(`T10X AutoFarm: SKIPPING ${farm.coords} — Radar scan already flags animals (${cachedAnimalCount})`);
           if (farm.state !== 'paused_animals') {
             farm.state = 'paused_animals';
-            listModified = true;
+            await atomicUpdateFarm(farm.id, { state: 'paused_animals' });
           }
           continue;
         }
@@ -302,14 +299,14 @@ async function runFarmCycle() {
       if (animalCheck.hasAnimals) {
         console.log(`T10X AutoFarm: Animals detected at ${farm.coords} — pausing`);
         farm.state = 'paused_animals';
-        listModified = true;
+        await atomicUpdateFarm(farm.id, { state: 'paused_animals' });
         continue;
       }
 
       // Clear paused state if animals are gone
       if (farm.state === 'paused_animals') {
         farm.state = 'unknown';
-        listModified = true;
+        await atomicUpdateFarm(farm.id, { state: 'unknown' });
       }
 
       // 5. Calculate optimal troop count via State Machine
@@ -335,16 +332,24 @@ async function runFarmCycle() {
         farm.exactArrivalTime = attackResult.arrivalTime || null;
         // Next attack allowed after troops arrive + 60s report buffer
         farm.nextAttackTime = attackResult.dispatchTime + travelTimeMs + 60000;
-        listModified = true;
+        
+        await atomicUpdateFarm(farm.id, {
+          lastHit: farm.lastHit,
+          lastTroopsSent: farm.lastTroopsSent,
+          estimatedArrivalTime: farm.estimatedArrivalTime,
+          exactArrivalTime: farm.exactArrivalTime,
+          nextAttackTime: farm.nextAttackTime
+        });
+
         console.log(`T10X AutoFarm: Attack sent to ${farm.coords}! Travel: ${Math.round(travelTimeMs/1000)}s, Arrival: ${attackResult.arrivalTime || 'unknown'}, Next in: ${Math.round((farm.nextAttackTime - Date.now())/1000)}s`);
 
         // Removed legacy setTimeout scrape: Reports are now deterministically synced by syncReports() on the next cycles
       } else if (attackResult.error === 'no_troops') {
-        // Don't hammer — set a 60s retry window. Troops from earlier raids will return
-        // by then, releasing capacity for this farm in round-robin order.
-        farm.nextAttackTime = Date.now() + 60000;
-        listModified = true;
-        console.log(`T10X AutoFarm: [SKIP] ${farm.coords} — no troops available, retry in 60s`);
+        // We lack troops globally. DO NOT penalize this farm's cooldown! 
+        // By leaving its nextAttackTime in the past, it will remain at the top of the queue 
+        // to receive the exact returning troops on the very next cycle.
+        console.log(`T10X AutoFarm: [WAITING] ${farm.coords} — no troops available. Reserving spot and aborting cycle.`);
+        break;
       } else {
         console.warn(`T10X AutoFarm: Attack FAILED for ${farm.coords}:`, attackResult.error);
       }
@@ -353,15 +358,24 @@ async function runFarmCycle() {
       await delay(2000 + Math.random() * 3000);
     }
 
-    // 8. Persist updated farm list
-    if (listModified) {
-      await chrome.storage.local.set({ active_farm_list: currentFarmList });
-    }
-
   } catch (e) {
     console.error('T10X AutoFarm: Cycle error', e);
   } finally {
     isFarmCycleRunning = false;
+  }
+}
+
+// ============================================================
+// ATOMIC STORAGE UPDATES
+// ============================================================
+
+async function atomicUpdateFarm(farmId, updates) {
+  const { active_farm_list } = await chrome.storage.local.get('active_farm_list');
+  if (!active_farm_list) return;
+  const idx = active_farm_list.findIndex(f => f.id === farmId);
+  if (idx !== -1) {
+    active_farm_list[idx] = { ...active_farm_list[idx], ...updates };
+    await chrome.storage.local.set({ active_farm_list });
   }
 }
 
