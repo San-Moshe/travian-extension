@@ -20,7 +20,9 @@ const AUTOFARM_DEFAULTS = {
   troop_carry_capacity: 50,
   base_probe_size: 3,
   overflow_multiplier: 2.0,
-  dead_blacklist_hours: 48
+  overflow_multiplier: 2.0,
+  dead_blacklist_hours: 48,
+  auto_enable_zero_animals: true
 };
 
 const TASK_MANAGER_DEFAULTS = {
@@ -136,7 +138,8 @@ async function runFarmCycle() {
       'troop_carry_capacity',
       'base_probe_size',
       'overflow_multiplier',
-      'dead_blacklist_hours'
+      'dead_blacklist_hours',
+      'auto_enable_zero_animals'
     ]);
 
     console.log('T10X AutoFarm: [CHECK] Settings loaded:', {
@@ -181,6 +184,46 @@ async function runFarmCycle() {
     console.log('T10X AutoFarm: [SYNC] Updating report cache with latest battles...');
     await syncReports(globalSettings);
     await processFarmTransitions();
+
+    // 2.7 Auto-Enable Logic: Add oases with 0 animals to farm list if enabled
+    if (settings.auto_enable_zero_animals) {
+      const { cached_oases, active_farm_list } = await chrome.storage.local.get(['cached_oases', 'active_farm_list']);
+      const currentList = active_farm_list || [];
+      const oases = cached_oases || [];
+      let addedAny = false;
+
+      oases.forEach(o => {
+        const animalCount = Object.values(o.animals || {}).reduce((sum, c) => sum + c, 0);
+        if (animalCount === 0) {
+          const coordStr = `${o.x}|${o.y}`;
+          const exists = currentList.find(f => f.coords === coordStr);
+          if (!exists) {
+            console.log(`T10X AutoFarm: Auto-enabling empty oasis at ${coordStr}`);
+            currentList.push({
+              coords: coordStr,
+              id: o.id,
+              x: o.x,
+              y: o.y,
+              dist: o.distance || 0,
+              lastHit: null,
+              lastBountyFull: false,
+              lastTroopsSent: 0,
+              pop: 15,
+              state: 'unknown',
+              type: 'oasis',
+              timeEmptied: null,
+              deadSince: null
+            });
+            addedAny = true;
+          }
+        }
+      });
+
+      if (addedAny) {
+        await chrome.storage.local.set({ active_farm_list: currentList });
+        console.log('T10X AutoFarm: Updated farm list with auto-enabled oases');
+      }
+    }
 
     // Re-fetch the farm list since processFarmTransitions might have mutated it
     const updatedSettings = await chrome.storage.local.get(['active_farm_list']);
@@ -252,13 +295,14 @@ async function runFarmCycle() {
 
       // 4. Safety Check — scrape oasis for animals
       const animalCheck = await checkOasisAnimals(farm.id, sessionKey);
+      
+      // Update Radar knowledge with latest animal count
+      await updateRadarKnowledge(farm.id, animalCheck.animals || {});
+
       if (animalCheck.hasAnimals) {
         console.log(`T10X AutoFarm: Animals detected at ${farm.coords} — pausing`);
         farm.state = 'paused_animals';
         listModified = true;
-        
-        // Update Radar knowledge with new animal discovery
-        await updateRadarKnowledge(farm.id, animalCheck.animals);
         continue;
       }
 
@@ -345,13 +389,13 @@ function calculateOptimalTroops(farm, gs) {
   switch (state) {
     // ---- State A: The Probe ----
     case 'unknown': {
-      return gs.base_probe_size;
+      return Math.max(gs.base_probe_size, 2);
     }
 
     // ---- State B: The Multiplier ----
     case 'overflow': {
-      const lastSent = farm.lastTroopsSent || gs.base_probe_size;
-      return Math.floor(lastSent * gs.overflow_multiplier);
+      const lastSent = farm.lastTroopsSent || Math.max(gs.base_probe_size, 2);
+      return Math.max(Math.floor(lastSent * gs.overflow_multiplier), 2);
     }
 
     // ---- State C: The Optimization ----
@@ -362,13 +406,13 @@ function calculateOptimalTroops(farm, gs) {
       const deltaHours = (Date.now() - timeEmptied) / 3600000;
       const totalRes = pEst * deltaHours;
       const troopsNeeded = Math.ceil(totalRes / gs.troop_carry_capacity) + 1;
-      // Don't send fewer than probe size
-      return Math.max(troopsNeeded, gs.base_probe_size);
+      // Don't send fewer than probe size, and absolutely never less than 2
+      return Math.max(troopsNeeded, gs.base_probe_size, 2);
     }
 
     // ---- Fallback ----
     default: {
-      return gs.base_probe_size;
+      return Math.max(gs.base_probe_size, 2);
     }
   }
 }
@@ -379,34 +423,63 @@ function calculateOptimalTroops(farm, gs) {
 
 async function checkOasisAnimals(tileId, sessionKey) {
   try {
-    const result = await fetchInGameTab(`${sessionKey}/village3.php?id=${tileId}`);
-    if (!result.ok) {
-      console.warn('T10X AutoFarm: Animal check HTTP error', result.status);
-      return { hasAnimals: true, count: -1, animals: {} };
-    }
+    const tabId = await getGameTabId();
+    if (!tabId) throw new Error('No game tab found');
 
-    const html = result.text;
-    let totalAnimals = 0;
-    const animals = {};
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: async (url) => {
+        try {
+          const response = await fetch(url);
+          if (!response.ok) return { hasAnimals: true, count: -1, animals: {} };
+          const html = await response.text();
+          
+          // FAST REGEX CHECK: Skip DOMParser if no animals are present
+          if (!/troop_info|unit_img|unit/i.test(html)) return { hasAnimals: false, count: 0, animals: {} };
 
-    // Scrape via BG_ANIMALS names (Regex)
-    for (const [key, def] of Object.entries(BG_ANIMALS)) {
-      const regex = new RegExp(def.name + '[^<]*?(\\d+)', 'gi');
-      const match = html.match(regex);
-      if (match) {
-        let count = 0;
-        for (const m of match) {
-          const num = m.match(/(\d+)/);
-          if (num) count += parseInt(num[1]) || 0;
+          const parser = new DOMParser();
+          const doc = parser.parseFromString(html, 'text/html');
+
+          let totalAnimals = 0;
+          const animals = {};
+          
+          const troopTable = doc.querySelector('table#troop_info');
+          if (troopTable) {
+            const rows = troopTable.querySelectorAll('tbody tr');
+            rows.forEach(row => {
+              const img = row.querySelector('img.unit');
+              const countCell = row.querySelector('td.val');
+              if (img && countCell) {
+                const title = (img.getAttribute('title') || img.getAttribute('alt') || '').toLowerCase();
+                const count = parseInt(countCell.textContent.replace(/\D/g, '')) || 0;
+                
+                const knownAnimals = {
+                  'rat': 'rat', 'spider': 'spider', 'snake': 'snake', 'bat': 'bat',
+                  'wild boar': 'boar', 'boar': 'boar', 'wolf': 'wolf', 'bear': 'bear',
+                  'crocodile': 'crocodile', 'tiger': 'tiger', 'elephant': 'elephant'
+                };
+                
+                for (const [k, v] of Object.entries(knownAnimals)) {
+                  if (title.includes(k)) {
+                    animals[v] = (animals[v] || 0) + count;
+                    totalAnimals += count;
+                    break;
+                  }
+                }
+              }
+            });
+          }
+          return { hasAnimals: totalAnimals > 0, count: totalAnimals, animals };
+        } catch (e) {
+          return { hasAnimals: true, count: -1, animals: {} };
         }
-        if (count > 0) {
-          animals[key] = count;
-          totalAnimals += count;
-        }
-      }
-    }
+      },
+      args: [`${sessionKey}/village3.php?id=${tileId}`]
+    });
 
-    return { hasAnimals: totalAnimals > 0, count: totalAnimals, animals };
+    const checkRes = results?.[0]?.result;
+    if (!checkRes) return { hasAnimals: true, count: -1, animals: {} };
+    return checkRes;
   } catch (e) {
     console.error('T10X AutoFarm: Animal check failed for tile', tileId, e);
     return { hasAnimals: true, count: -1, animals: {} };
@@ -486,7 +559,8 @@ async function executeAttack(farm, troopCount, troopId, sessionKey) {
           }
           // Cap requested count to what's available
           const sendCount = (available !== null) ? Math.min(troopCount, available) : troopCount;
-          if (sendCount <= 0) return { ok: false, error: 'no_troops', available };
+          // Rule: Never send just 1 troop, it will die to base defense. Wait for more troops to build up instead.
+          if (sendCount < 2) return { ok: false, error: 'no_troops', available };
 
           input.value = sendCount;
 
@@ -739,65 +813,68 @@ async function syncReports(globalSettings) {
     // Reversing ensures the latest report is processed last, leaving it in the cache!
     const unseenIds = recentReportIds.filter(id => !processedIds.includes(id)).reverse();
 
-    for (const reportId of unseenIds) {
-      const reportResult = await fetchInGameTab(`${sessionKey}/report.php?id=${reportId}`);
-      if (!reportResult.ok) continue;
-
-      const html = reportResult.text;
-      const text = html.replace(/<[^>]+>/g, ' ');
-
-      // 1. Extract Target Tile ID (Deterministic Anchor)
-      // Look for: href="village3.php?id=10387" inside the Defender block
-      const defenderBlock = html.match(/(?:Defender|Verteidiger|Défenseur)[\s\S]{0,1000}?(?:tbody\s+class="units"|table\s+cellpadding)/i) 
-                        || html.match(/(?:Defender|Verteidiger|Défenseur)[\s\S]{0,500}/i);
+    // Parallel Sync Engine: Fetch unseen reports in batches
+    const batchSize = 5;
+    for (let i = 0; i < unseenIds.length; i += batchSize) {
+      const batch = unseenIds.slice(i, i + batchSize);
       
-      let targetTileId = null;
-      if (defenderBlock) {
-        const idMatch = defenderBlock[0].match(/village3\.php\?id=(\d+)/i);
-        if (idMatch) {
-          targetTileId = idMatch[1];
-        }
-      }
+      await Promise.all(batch.map(async (reportId) => {
+        const reportResult = await fetchInGameTab(`${sessionKey}/report.php?id=${reportId}`);
+        if (!reportResult.ok) return;
 
-      if (!targetTileId) {
-        // If we can't tie it to a tile, mark as processed and skip
+        const html = reportResult.text;
+        const text = html.replace(/<[^>]+>/g, ' ');
+
+        // 1. Extract Target Tile ID
+        const defenderBlock = html.match(/(?:Defender|Verteidiger|Défenseur)[\s\S]{0,1000}?(?:tbody\s+class="units"|table\s+cellpadding)/i) 
+                          || html.match(/(?:Defender|Verteidiger|Défenseur)[\s\S]{0,500}/i);
+        
+        let targetTileId = null;
+        if (defenderBlock) {
+          const idMatch = defenderBlock[0].match(/village3\.php\?id=(\d+)/i);
+          if (idMatch) targetTileId = idMatch[1];
+        }
+
+        if (!targetTileId) {
+          processedIds.push(reportId);
+          processedModified = true;
+          return;
+        }
+
+        // 2. Extract Exact Time
+        let timeMatch = html.match(/class=["']sent["'][^>]*>[\s\S]*?<span>\s*([\d:]+)\s*<\/span>/i);
+        let reportTimeStr = timeMatch ? timeMatch[1] : null;
+
+        // 3. Extract attacker troops sent
+        const reportedTroops = extractAttackerTroopCount(html);
+        
+        // 4. Extract Casualties and Bounty
+        const hasCasualties = detectCasualties(html, text);
+        const carryCapacity = globalSettings?.troop_carry_capacity || 50;
+        const bountyInfo = detectBounty(html, text, reportedTroops || 1, carryCapacity);
+
+        // Store in Cache
+        reportCache[targetTileId] = {
+          reportId: reportId,
+          targetTileId: targetTileId,
+          timeParsed: Date.now(),
+          reportTimeStr: reportTimeStr,
+          hasCasualties: hasCasualties,
+          bountyTotal: bountyInfo.total,
+          bountyPercent: bountyInfo.percent,
+          isFull: bountyInfo.isFull,
+          troopsSentRecorded: reportedTroops
+        };
+
+        cacheModified = true;
         processedIds.push(reportId);
         processedModified = true;
-        continue;
-      }
 
-      // 2. Extract Exact Time
-      // Look for: <td class="sent">Sent:</td><td>in 04 Apr 2026, <span> 23:48:20</span></td>
-      let timeMatch = html.match(/class=["']sent["'][^>]*>[\s\S]*?<span>\s*([\d:]+)\s*<\/span>/i);
-      let reportTimeStr = timeMatch ? timeMatch[1] : null;
+        console.log(`T10X AutoFarm: Synced Report ${reportId} for Tile ${targetTileId}`);
+      }));
 
-      // 3. Extract attacker troops sent (needed for carrying capacity calc)
-      const reportedTroops = extractAttackerTroopCount(html);
-      
-      // 4. Extract Casualties and Bounty
-      const hasCasualties = detectCasualties(html, text);
-      const carryCapacity = globalSettings?.troop_carry_capacity || 50;
-      const bountyInfo = detectBounty(html, text, reportedTroops || 1, carryCapacity);
-
-      // Store in Cache (Overwriting older ones because we loop oldest-to-newest)
-      reportCache[targetTileId] = {
-        reportId: reportId,
-        timeParsed: Date.now(),
-        reportTimeStr: reportTimeStr, // Useful for debug/correlation
-        hasCasualties: hasCasualties,
-        bountyTotal: bountyInfo.total,
-        bountyPercent: bountyInfo.percent,
-        isFull: bountyInfo.isFull,
-        troopsSentRecorded: reportedTroops
-      };
-
-      cacheModified = true;
-
-      // Mark processed
-      processedIds.push(reportId);
-      processedModified = true;
-
-      console.log(`T10X AutoFarm: Synced Report ${reportId} for Tile ${targetTileId}`);
+      // Small delay between batches to avoid server throttling
+      if (i + batchSize < unseenIds.length) await delay(300);
     }
 
     // Keep processed list from leaking memory infinitely (keep last 500)
@@ -842,11 +919,20 @@ async function processFarmTransitions() {
     // Check if we already applied this specific report
     if (farm.lastAppliedReportId === report.reportId) continue;
 
-    // Ensure the report is ACTUALLY from our recent attack.
-    // The report must have been parsed AFTER we dispatched the troops!
-    // (A 1-minute buffer is safe since attacks take time to arrive).
-    // Or simpler: if this report was parsed after we dispatched + some time.
-    if (report.timeParsed > farm.lastHit) {
+    // Check if report time exactly matches our recorded exact arrival time
+    const exactArrivalStr = farm.exactArrivalTime ? farm.exactArrivalTime.trim() : null;
+    const reportTimeStr = report.reportTimeStr ? report.reportTimeStr.trim() : null;
+    
+    // An exact match confirms unequivocally that this report belongs to this dispatch.
+    const isExactMatch = exactArrivalStr && reportTimeStr && exactArrivalStr === reportTimeStr;
+    
+    // If we don't have an exact match (e.g., legacy data or slight parse variance),
+    // fallback to ensuring the current physical time is realistically AFTER the expected arrival time 
+    // AND the report was newly discovered after we dispatched our troops.
+    const hasArrived = farm.estimatedArrivalTime && Date.now() > (farm.estimatedArrivalTime - 2000);
+    const isNewReport = report.timeParsed > farm.lastHit;
+
+    if (isExactMatch || (!exactArrivalStr && hasArrived && isNewReport)) {
       console.log(`T10X AutoFarm: Applying Report ${report.reportId} to Farm ${farm.coords}`);
 
       if (report.hasCasualties) {
@@ -944,25 +1030,46 @@ function detectBounty(html, text, troopsSent, carryCapacity) {
  * Used as a heuristic fingerprint to identify reports.
  */
 function extractAttackerTroopCount(html) {
-  const attackerBlock = html.match(/(?:attacker|angreifer|attaquant)[\s\S]{0,1500}/i);
+  const attackerBlock = html.match(/(?:attacker|angreifer|attaquant)[\s\S]{0,2500}/i);
   if (!attackerBlock) return -1;
   const blockHtml = attackerBlock[0];
 
-  // Try to find the row containing troop counts, typically in an element with class "units" or under "Troops"
-  const tbodyMatch = blockHtml.match(/class=["']units["'][^>]*>[\s\S]*?(?:<tr>){1,2}([\s\S]*?)<\/tr>/i)
-                  || blockHtml.match(/(?:troops|truppen|troupes)[\s\S]*?<\/td>([\s\S]*?)<\/tr>/i);
-
+  const tbodyMatch = blockHtml.match(/class=["']units["'][^>]*>([\s\S]*?)<\/tbody>/i);
   if (tbodyMatch) {
-    const rowHtml = tbodyMatch[1] || tbodyMatch[0];
-    const tds = rowHtml.match(/<td[^>]*>([\s\S]*?)<\/td>/gi) || [];
+    const rows = tbodyMatch[1].match(/<tr[^>]*>([\s\S]*?)<\/tr>/gi);
+    if (rows && rows.length >= 2) {
+      let targetRow = rows[1];
+      for (const row of rows) {
+        if (/(?:troops|truppen|troupes|cantidad|quantité)/i.test(row)) {
+          targetRow = row;
+          break;
+        }
+      }
+      
+      const tds = targetRow.match(/<td[^>]*>([\s\S]*?)<\/td>/gi) || [];
+      let sum = 0;
+      for (const td of tds) {
+        const cleanText = td.replace(/<[^>]+>/g, '');
+        const val = parseInt(cleanText.replace(/\D/g, '')) || 0;
+        sum += val;
+      }
+      if (sum > 0) return sum;
+    }
+  }
+
+  // Fallback for older layouts
+  const troopsRow = blockHtml.match(/(?:<th>|<td>)(?:troops|truppen|troupes|cantidad)[^<]*<\/(?:th|td)>([\s\S]*?)<\/tr>/i);
+  if (troopsRow) {
+    const tds = troopsRow[1].match(/<td[^>]*>([\s\S]*?)<\/td>/gi) || [];
     let sum = 0;
-    // Standard T3.6 row has counts for 10 unit types and 1 hero
     for (const td of tds) {
-      const val = parseInt(td.replace(/\D/g, '')) || 0;
+      const cleanText = td.replace(/<[^>]+>/g, '');
+      const val = parseInt(cleanText.replace(/\D/g, '')) || 0;
       sum += val;
     }
     if (sum > 0) return sum;
   }
+
   return -1;
 }
 

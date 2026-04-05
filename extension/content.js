@@ -157,11 +157,11 @@ const T10X_CONFIG = {
     iron: { wood: 75, clay: 75, iron: 50, crop: 50 },
     crop: { wood: 70, clay: 80, iron: 70, crop: 50 }
   },
-  scanConcurrency: 20,
-  scanBaseDelay: 50,
-  scanJitter: 100,
-  scanRestTiles: 400,
-  scanRestDuration: 1500
+  scanConcurrency: 50,
+  scanBaseDelay: 10,
+  scanJitter: 50,
+  scanRestTiles: 1000,
+  scanRestDuration: 1000
 };
 
 const T10X_ANIMALS = {
@@ -878,73 +878,175 @@ async function startOasisScan() {
     centerY = parseInt(urlParams.get('y')) || 0;
   }
 
-  // console.log('T10X: Parallel Fuzzy Scan starting...', { radius, concurrency: T10X_CONFIG.scanConcurrency });
-  const scanCoords = getSpiralCoordinates(radius, centerX, centerY, 1);
-  const total = scanCoords.length;
-  let currentCount = 0;
-  const foundOases = [];
-  
-  t10xShowScannerProgress(0, total);
+  // --- PHASE 1: DISCOVERY (Map Blocks) ---
+  // We hop through the map in a 7x7 grid to locate 49 tiles at a time
+  const blockCoords = getSpiralCoordinates(radius, centerX, centerY, 7);
+  const totalBlocks = blockCoords.length;
+  let blocksProcessed = 0;
+  const discoveredOasisIds = new Set(); 
 
-  // Worker implementation for parallel processing
-  const runWorker = async () => {
-    while (scanCoords.length > 0) {
-      // Perform atomic shift from queue
-      const coord = scanCoords.shift();
+  t10xShowScannerProgress(0, totalBlocks, 'Phase 1: Discovering Map Blocks...');
+
+  const runDiscoveryWorker = async () => {
+    while (blockCoords.length > 0) {
+      const coord = blockCoords.shift();
       if (!coord) break;
 
-      const { x, y, dist } = coord;
-      const id = t10xGetIdFromCoords(x, y);
+      const centerId = t10xGetIdFromCoords(coord.x, coord.y);
+      try {
+        const oasisIds = await fetchOasisIdsFromMapBlockById(centerId);
+        oasisIds.forEach(id => discoveredOasisIds.add(id));
+      } catch (e) {
+        console.warn(`Discovery failed at block ${coord.x}, ${coord.y}`, e);
+      }
 
-      // 1. Anti-bot jitter delay (human-like variability)
+      blocksProcessed++;
+      if (blocksProcessed % 10 === 0 || blocksProcessed === totalBlocks) {
+         t10xShowScannerProgress(blocksProcessed, totalBlocks, 'Phase 1: Discovering Map Blocks...');
+      }
+    }
+  };
+
+  const discoveryWorkers = [];
+  const discoveryConcurrency = Math.min(T10X_CONFIG.scanConcurrency, 20); // Keep max 20 for map blocks
+  for (let i = 0; i < discoveryConcurrency; i++) {
+    discoveryWorkers.push(runDiscoveryWorker());
+  }
+  await Promise.all(discoveryWorkers);
+
+  // Filter and calculate wrapped-distance for the discovered oases to ensure they fall within the scanned radius
+  const validOasesQueue = [];
+  for (const id of discoveredOasisIds) {
+      const coords = t10xGetCoordsFromId(id);
+      
+      let dx = Math.abs(coords.x - centerX);
+      if (dx > 200) dx = 400 - dx;
+      
+      let dy = Math.abs(coords.y - centerY);
+      if (dy > 200) dy = 400 - dy;
+      
+      const dist = Math.sqrt(dx*dx + dy*dy);
+      
+      if (dist <= radius) {
+          validOasesQueue.push({ id, ...coords, dist });
+      }
+  }
+
+  // Sort by nearest first
+  validOasesQueue.sort((a, b) => a.dist - b.dist);
+
+  // --- PHASE 2: DEEP SCAN (Detected Oases Only) ---
+  const totalOases = validOasesQueue.length;
+  let oasesProcessed = 0;
+  const foundOases = [];
+  
+  t10xShowScannerProgress(0, totalOases, `Phase 2: Scanning ${totalOases} Oases...`);
+
+  // Worker implementation for parallel processing
+  const runDeepWorker = async () => {
+    while (validOasesQueue.length > 0) {
+      const target = validOasesQueue.shift();
+      if (!target) break;
+
+      // Anti-bot jitter delay
       const jitter = Math.random() * T10X_CONFIG.scanJitter;
-      await new Promise(r => setTimeout(r, T10X_CONFIG.scanBaseDelay + jitter));
+      if (T10X_CONFIG.scanBaseDelay + jitter > 0) {
+         await new Promise(r => setTimeout(r, T10X_CONFIG.scanBaseDelay + jitter));
+      }
 
-      // 2. Periodic Micro-Nap for human-like behavior
-      if (currentCount > 0 && currentCount % T10X_CONFIG.scanRestTiles === 0) {
-        const nap = Math.random() * T10X_CONFIG.scanRestDuration + 2000;
-        // console.log(`T10X: Worker taking a ${Math.round(nap/1000)}s rest to avoid detection...`);
+      // Periodic Micro-Nap for human-like behavior
+      if (oasesProcessed > 0 && oasesProcessed % T10X_CONFIG.scanRestTiles === 0) {
+        const nap = Math.random() * T10X_CONFIG.scanRestDuration + 1000;
         await new Promise(r => setTimeout(r, nap));
       }
 
       try {
-        const oasis = await fetchOasisFromID(id, x, y);
+        const oasis = await fetchOasisFromID(target.id, target.x, target.y);
         if (oasis) {
-          oasis.distance = dist;
+          oasis.distance = target.dist;
           oasis.simulation = simulateOasisBattle(army, oasis.animals);
           foundOases.push(oasis);
         }
       } catch (e) {
-        console.warn('Scan failed for tile', id, e);
+        console.warn('Scan failed for tile', target.id, e);
       }
 
-      currentCount++;
-      // Smooth progress update
-      t10xShowScannerProgress(currentCount, total);
+      oasesProcessed++;
+      if (oasesProcessed % 5 === 0 || oasesProcessed === totalOases) {
+        t10xShowScannerProgress(oasesProcessed, totalOases, `Phase 2: Scanning ${totalOases} Oases...`);
+      }
     }
   };
 
-  // Launch parallel workers
-  const workers = [];
-  for (let i = 0; i < (T10X_CONFIG.scanConcurrency || 20); i++) {
-    workers.push(runWorker());
-    // Stagger worker starts slightly to avoid burst spike
-    await new Promise(r => setTimeout(r, 50 + Math.random() * 100));
+  const deepConcurrency = parseInt(T10X_CONFIG.scanConcurrency) || 100;
+  const deepWorkers = [];
+  for (let i = 0; i < deepConcurrency; i++) {
+    deepWorkers.push(runDeepWorker());
+    if (i % 10 === 0) await new Promise(r => setTimeout(r, 10)); // Stagger
   }
 
-  // Wait for all paths to complete
-  await Promise.all(workers);
+  await Promise.all(deepWorkers);
 
   // Save results
   t10xState.cachedOases = foundOases;
   await t10xSetSettings({ cached_oases: foundOases });
   
   t10xShowScannerDashboard(foundOases);
+  
+  if (t10xIsContextValid()) {
+    chrome.runtime.sendMessage({ action: 'force_farm_check' });
+  }
 }
 
 /**
- * Calculate the unique tile ID based on the server's mathematical pattern
+ * Fetch a map block and extract all oasis IDs found within it.
+ * Covers 7x7 tiles per request (id based)
  */
+async function fetchOasisIdsFromMapBlockById(centerId) {
+  const kParam = t10xSessionKey ? `&k=${t10xSessionKey}` : '';
+  const url = `map.php?id=${centerId}${kParam}`;
+  const found = [];
+
+  try {
+    const response = await fetch(url);
+    const html = await response.text();
+    
+    if (!/map_content/i.test(html)) return [];
+
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    
+    // Select all potential oasis area tags
+    const areas = doc.querySelectorAll('area[alt*="Oas"], area[alt*="oas"], area[alt*="Oase"], area[alt*="oase"], area[title*="Oas"], area[title*="oas"], area[title*="Oase"], area[title*="oase"]');
+    
+    areas.forEach(area => {
+      const idStr = area.getAttribute('href')?.match(/id=(\d+)/)?.[1];
+      if (idStr) {
+        found.push(parseInt(idStr));
+      }
+    });
+
+    return found;
+  } catch (e) {
+    return [];
+  }
+}
+
+/**
+ * Reverse calculate map coordinates from unique tile ID
+ */
+function t10xGetCoordsFromId(id) {
+  const mapWidth = 400;
+  const zeroBased = id - 1;
+  const x_idx = Math.floor(zeroBased / mapWidth);
+  const y_idx = zeroBased % mapWidth;
+  
+  // Convert 0-399 back to -199 to +200 map bounds standard 
+  let x = x_idx > 200 ? x_idx - mapWidth : x_idx;
+  let y = y_idx > 200 ? y_idx - mapWidth : y_idx;
+  
+  return {x, y};
+}
 function t10xGetIdFromCoords(x, y) {
   // Correct pattern for Zravian's 400x400 map
   // Wraps negative coordinates correctly using modulo arithmetic
@@ -962,18 +1064,17 @@ async function fetchOasisFromID(id, x, y) {
   try {
     const response = await fetch(url);
     const html = await response.text();
+    
+    // FAST REGEX CHECK: Avoid DOMParser overhead for the initial "is it an oasis" validation
+    // drastically speeds up scan performance for the thousands of 'empty' tiles
+    if (!/unoccupied|oasis|occupied|oase/i.test(html)) return null;
+    if (html.match(/player|spieler|clan|alliance/i) && !/unoccupied|unbesetzt/i.test(html)) return null;
+
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, 'text/html');
-    
-    // Verify if it is an unoccupied oasis (Reliable ID check)
-    const pageTitle = doc.title || '';
-    const h1 = doc.querySelector('h1')?.textContent || '';
-    const textContent = doc.body.textContent || '';
-    
-    const isOasis = /unoccupied|oasis|occupied|oase/i.test(h1 + pageTitle + textContent);
-    const isOccupied = (h1 + pageTitle + textContent).match(/player|spieler|clan|alliance/i) && !/unoccupied|unbesetzt/i.test(h1 + pageTitle + textContent);
 
-    if (!isOasis || isOccupied) return null;
+    
+    const textContent = doc.body.textContent || '';
 
     // Detect Oasis Type
     let type = 'Oasis';
@@ -1029,27 +1130,32 @@ async function fetchOasisFromID(id, x, y) {
   }
 }
 
-function t10xShowScannerProgress(current, total) {
+function t10xShowScannerProgress(current, total, phase = 'Scanning Map...') {
   let progress = document.getElementById('t10x-scan-progress');
   if (!progress) {
     progress = document.createElement('div');
     progress.id = 't10x-scan-progress';
-    progress.style = 'position:fixed; top:20px; left:50%; transform:translateX(-50%); background:#1a1a2e; border:2px solid #4ecca3; padding:10px 20px; color:#fff; z-index:100000; border-radius:8px; box-shadow:0 4px 20px rgba(0,0,0,0.5); font-weight:bold;';
+    progress.style = 'position:fixed; top:20px; left:50%; transform:translateX(-50%); background:#1a1a2e; border:2px solid #4ecca3; padding:10px 20px; color:#fff; z-index:100000; border-radius:8px; box-shadow:0 4px 20px rgba(0,0,0,0.5); font-weight:bold; width: 300px; text-align: center;';
     document.body.appendChild(progress);
   }
   
-  if (current >= total) {
+  if (current >= total && phase.includes('Phase 2')) {
     progress.textContent = 'Scan Complete! Generating Dashboard...';
     setTimeout(() => progress.remove(), 2000);
   } else {
-    progress.textContent = `Scanning Map: ${current} / ${total} tiles...`;
+    const percent = Math.round((current / total) * 100);
+    progress.innerHTML = `
+      <div style="margin-bottom: 5px;">${phase}</div>
+      <div style="font-size: 11px; color: #888;">${current} / ${total} items (${percent}%)</div>
+      <div style="background: #000; height: 4px; border-radius: 2px; margin-top: 8px;">
+        <div style="background: #4ecca3; height: 100%; width: ${percent}%; transition: width 0.3s; border-radius: 2px;"></div>
+      </div>
+    `;
   }
 }
 
 async function t10xShowScannerDashboard(oases) {
   const sidePanel = t10xGetSidePanel();
-  const existing = document.getElementById('t10x-oasis-dashboard');
-  if (existing) existing.remove();
 
   // (Bottom panel Auto-Farm control removed per user request)
 
@@ -1060,6 +1166,9 @@ async function t10xShowScannerDashboard(oases) {
   );
   const isMasterOn = farmState.is_autofarming_active;
   const farmList = farmState.active_farm_list || [];
+
+  const existing = document.getElementById('t10x-oasis-dashboard');
+  if (existing) existing.remove();
 
   const panel = document.createElement('div');
   panel.id = 't10x-oasis-dashboard';
@@ -1148,6 +1257,14 @@ async function t10xShowScannerDashboard(oases) {
       btn.addEventListener('click', () => window.t10xFilterOases(type));
       filtersDiv.appendChild(btn);
     });
+
+    const enableAllBtn = document.createElement('button');
+    enableAllBtn.className = 't10x-enable-all-btn';
+    enableAllBtn.textContent = 'Enable All Empty';
+    enableAllBtn.title = 'Add all oases with 0 animals to the farm list';
+    enableAllBtn.addEventListener('click', () => t10xEnableAllEmptyOases(oases));
+    filtersDiv.appendChild(enableAllBtn);
+
     panel.appendChild(filtersDiv);
 
     // Table
@@ -1426,6 +1543,53 @@ async function t10xToggleFarmTarget({ coords, id, x, y, dist, isOn }) {
 }
 
 /**
+ * Handle "Enable All Empty" button - bulk enrols all 0-animal oases from cached_oases
+ */
+async function t10xEnableAllEmptyOases(oases) {
+  if (!oases || oases.length === 0) return;
+  
+  const { active_farm_list } = await t10xGetSettings(['active_farm_list'], { active_farm_list: [] });
+  let farmList = active_farm_list || [];
+  let addedAny = false;
+
+  oases.forEach(o => {
+    const animalCount = Object.values(o.animals || {}).reduce((sum, c) => sum + c, 0);
+    if (animalCount === 0) {
+      const coordStr = `${o.x}|${o.y}`;
+      const exists = farmList.find(f => f.coords === coordStr);
+      if (!exists) {
+        farmList.push({
+          coords: coordStr,
+          id: o.id,
+          x: o.x,
+          y: o.y,
+          dist: o.distance || 0,
+          lastHit: null,
+          lastBountyFull: false,
+          lastTroopsSent: 0,
+          pop: 15,
+          state: 'unknown',
+          type: 'oasis',
+          timeEmptied: null,
+          deadSince: null
+        });
+        addedAny = true;
+      }
+    }
+  });
+
+  if (addedAny) {
+    await t10xSetSettings({ active_farm_list: farmList });
+    // Trigger immediate farm check in background
+    if (t10xIsContextValid()) {
+      try {
+        chrome.runtime.sendMessage({ action: 'force_farm_check' });
+      } catch (e) {}
+    }
+  }
+}
+
+/**
  * Sync farm row highlights when active_farm_list changes (called by storage listener)
  */
 function t10xSyncFarmRowHighlights(farmList) {
@@ -1602,16 +1766,15 @@ async function calculateROI() {
   renderROITable([], true);
 
   // 1. Get Fields (Cached or Scanned)
+  const isVillage1 = window.location.pathname.includes('village1.php') || window.location.pathname.includes('dorf1.php');
+  const fieldData = t10xGetFieldData();
   let fieldsToFetch = t10xState.cachedFields || [];
   
-  if (fieldsToFetch.length === 0) {
-    console.log('T10X: No cached fields, scanning current page...');
-    const fieldData = t10xGetFieldData();
-    if (fieldData.length > 0) {
-      fieldsToFetch = deduplicateFields(fieldData);
-      t10xState.cachedFields = fieldsToFetch;
-      localStorage.setItem('t10x-cached-fields', JSON.stringify(fieldsToFetch));
-    }
+  if ((isVillage1 && fieldData.length > 5) || (fieldsToFetch.length === 0 && fieldData.length > 0)) {
+    // console.log('T10X: Updating cached fields from current page...');
+    fieldsToFetch = deduplicateFields(fieldData);
+    t10xState.cachedFields = fieldsToFetch;
+    localStorage.setItem('t10x-cached-fields', JSON.stringify(fieldsToFetch));
   }
 
   if (fieldsToFetch.length === 0) {
@@ -1835,13 +1998,25 @@ function renderROITable(upgradeData, isLoading, errorMsg) {
   errorMsg = errorMsg || '';
   
   const sidePanel = t10xGetSidePanel();
-  var oldTable = document.getElementById('t10x-roi-table');
-  if (oldTable) oldTable.remove();
+  var tableContainer = document.getElementById('t10x-roi-table');
   
-  var tableContainer = document.createElement('div');
-  tableContainer.id = 't10x-roi-table';
-  tableContainer.className = 't10x-roi-table';
-  sidePanel.prepend(tableContainer);
+  if (!tableContainer) {
+    tableContainer = document.createElement('div');
+    tableContainer.id = 't10x-roi-table';
+    tableContainer.className = 't10x-roi-table';
+    sidePanel.prepend(tableContainer);
+  } else if (isLoading && tableContainer.querySelector('table')) {
+    // If we're loading but already have a table, just show a loading state on the button
+    // This prevents the whole table from disappearing and the UI jumping
+    var btn = tableContainer.querySelector('.t10x-refresh-btn');
+    if (btn) btn.textContent = '↻ Scanning...';
+    tableContainer.style.opacity = '0.6';
+    tableContainer.style.pointerEvents = 'none';
+    return;
+  }
+  
+  tableContainer.style.opacity = '1';
+  tableContainer.style.pointerEvents = 'auto';
   
   var html = '<h3>ROI Calculator <button class="t10x-refresh-btn">↻ Refresh</button></h3>';
   
