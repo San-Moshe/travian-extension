@@ -6,7 +6,8 @@ document.addEventListener('DOMContentLoaded', function() {
     'cropRadar',
     'oasisScanner',
     'roiCalculator',
-    'protectionTracker'
+    'protectionTracker',
+    'auto_enable_zero_animals'
   ];
 
   // Numeric input settings with their defaults
